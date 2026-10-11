@@ -549,7 +549,8 @@ async def on_app_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-@slash("report", "সিস্টেমের বর্তমান অবস্থা")
+@bot.tree.command(name="report", description="সিস্টেমের বর্তমান অবস্থা")
+@app_commands.guild_only()
 async def report(interaction: discord.Interaction):
     lic = q_one("SELECT COUNT(*) FROM licenses")
     op = q_one("SELECT COUNT(*) FROM tickets WHERE status='open'")
@@ -557,7 +558,8 @@ async def report(interaction: discord.Interaction):
         f"🛡️ ISS Report: system active.\nLicenses: {lic} | Open tickets: {op}")
 
 
-@slash("weekly_report", "গত ৭ দিনের রিপোর্ট")
+@bot.tree.command(name="weekly_report", description="গত ৭ দিনের রিপোর্ট")
+@app_commands.guild_only()
 async def weekly_report(interaction: discord.Interaction):
     since = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
     nl = q_one("SELECT COUNT(*) FROM licenses WHERE created>=?", (since,))
