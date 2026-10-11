@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from typing import Literal
-from flask import (Flask, render_template_string, request, redirect,
+from flask import (Flask, Response, render_template_string, request, redirect,
                    url_for, session, abort, g)
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_limiter import Limiter
@@ -185,15 +185,138 @@ def page(title, body_tpl, **ctx):
 # ------------------------------------------------------------------
 # Home
 # ------------------------------------------------------------------
+LANDING_HTML = r'''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ISS Enterprise & Cloud Security</title>
+<meta name="description" content="ISS: license management, client portal, support tickets and Discord control for your security business.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#050914;--line:rgba(140,170,255,.13);--text:#e8eefc;--mute:#93a3c7;--cy:#2de2ff;--vi:#7a5cff;--mg:#ff4fd8;--ok:#3dffb0}
+*{box-sizing:border-box;margin:0}
+html{scroll-behavior:smooth}
+body{font-family:'DM Sans',system-ui,sans-serif;background:var(--ink);color:var(--text);line-height:1.6;overflow-x:hidden}
+body:before{content:"";position:fixed;inset:0;z-index:-1;background:radial-gradient(60% 50% at 82% 0%,rgba(122,92,255,.3),transparent 70%),radial-gradient(45% 40% at 0% 35%,rgba(45,226,255,.14),transparent 70%),linear-gradient(var(--line) 1px,transparent 1px) 0 0/56px 56px,linear-gradient(90deg,var(--line) 1px,transparent 1px) 0 0/56px 56px}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--cy);outline-offset:3px;border-radius:6px}
+.wrap{max-width:1120px;margin:auto;padding:0 22px}
+h1,h2,h3{font-family:'Syne',sans-serif;line-height:1.08}
+nav{position:sticky;top:0;z-index:5;backdrop-filter:blur(14px);background:rgba(5,9,20,.7);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;justify-content:space-between;height:66px}
+.brand{font-family:'Syne';font-weight:800;font-size:1.25rem;display:flex;gap:10px;align-items:center}
+.brand i{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,var(--cy),var(--vi));display:grid;place-items:center;font-style:normal;font-size:16px}
+.links{display:flex;gap:26px;align-items:center;color:var(--mute);font-size:.95rem}
+.links a:hover{color:#fff}
+.btn{display:inline-block;padding:12px 24px;border-radius:12px;font-weight:700;background:linear-gradient(120deg,var(--cy),var(--vi));color:#04101c;box-shadow:0 8px 30px rgba(45,226,255,.28);transition:transform .2s,box-shadow .2s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 12px 40px rgba(122,92,255,.45)}
+.btn.ghost{background:transparent;color:var(--text);border:1px solid rgba(255,255,255,.22);box-shadow:none}
+.btn.ghost:hover{border-color:var(--cy)}
+.hero{display:grid;grid-template-columns:1.1fr .9fr;gap:40px;align-items:center;padding:70px 0 90px}
+.hero h1{font-size:clamp(2.5rem,6vw,4.7rem);font-weight:800;letter-spacing:-.02em}
+.hero h1 span{display:block;background:linear-gradient(100deg,var(--cy),var(--vi) 55%,var(--mg));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{color:var(--mute);font-size:1.15rem;max-width:34rem;margin:22px 0 32px}
+.cta{display:flex;gap:14px;flex-wrap:wrap}
+.hero .in{opacity:0;transform:translateY(22px);animation:up .8s cubic-bezier(.2,.7,.2,1) forwards}
+.hero .in:nth-child(2){animation-delay:.12s}.hero .in:nth-child(3){animation-delay:.24s}
+@keyframes up{to{opacity:1;transform:none}}
+.radar{width:min(430px,88vw);aspect-ratio:1;border-radius:50%;position:relative;margin:auto;border:1px solid rgba(45,226,255,.45);background:repeating-radial-gradient(circle,transparent 0 39px,rgba(45,226,255,.2) 40px 41px),radial-gradient(circle,rgba(45,226,255,.1),transparent 72%);box-shadow:0 0 90px rgba(45,226,255,.2),inset 0 0 70px rgba(122,92,255,.25);animation:up 1.1s .3s both}
+.radar:before,.radar:after{content:"";position:absolute;background:rgba(45,226,255,.18)}
+.radar:before{left:50%;top:0;bottom:0;width:1px}.radar:after{top:50%;left:0;right:0;height:1px}
+.sweep{position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg,rgba(45,226,255,.6),rgba(45,226,255,0) 30%);animation:spin 4.5s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.b{position:absolute;width:11px;height:11px;border-radius:50%;background:var(--mg);box-shadow:0 0 16px var(--mg);opacity:0;animation:blip 4.5s infinite}
+@keyframes blip{0%{opacity:0;transform:scale(.3)}8%{opacity:1;transform:scale(1.5)}45%{opacity:0;transform:scale(1)}100%{opacity:0}}
+.shield{position:absolute;inset:0;display:grid;place-items:center;filter:drop-shadow(0 0 22px rgba(45,226,255,.7))}
+.chip{position:absolute;padding:8px 14px;border-radius:999px;font-size:.82rem;font-weight:500;background:rgba(8,14,30,.85);border:1px solid var(--line);backdrop-filter:blur(8px);display:flex;gap:8px;align-items:center}
+.chip:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+section{padding:80px 0}
+h2{font-size:clamp(1.9rem,4vw,3rem);font-weight:800;max-width:30rem}
+.sub{color:var(--mute);max-width:34rem;margin:14px 0 40px}
+.bento{display:grid;grid-template-columns:repeat(6,1fr);gap:16px}
+.bt{position:relative;overflow:hidden;padding:28px;border-radius:22px;border:1px solid var(--line);background:linear-gradient(160deg,rgba(255,255,255,.05),rgba(255,255,255,.01));grid-column:span 2}
+.bt.big{grid-column:span 4}
+.bt:before{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(260px circle at var(--x,50%) var(--y,-40%),rgba(45,226,255,.16),transparent 70%)}
+.bt h3{font-size:1.35rem;margin-bottom:8px}
+.bt p{color:var(--mute);font-size:.98rem}
+.rows{margin-top:22px;display:grid;gap:10px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-radius:12px;background:rgba(5,9,20,.7);border:1px solid var(--line);font-size:.9rem;font-family:ui-monospace,Menlo,monospace;color:var(--mute)}
+.pill{padding:3px 12px;border-radius:99px;font:700 .75rem 'DM Sans';color:#04101c;background:var(--ok)}
+.pill.v{background:var(--vi);color:#fff}.pill.c{background:var(--cy)}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;position:relative}
+.steps:before{content:"";position:absolute;top:27px;left:6%;right:6%;height:2px;background:linear-gradient(90deg,var(--cy),var(--vi),var(--mg));opacity:.5}
+.step b{position:relative;display:grid;place-items:center;width:54px;height:54px;border-radius:50%;background:var(--ink);border:2px solid var(--cy);font:800 1.2rem 'Syne';margin-bottom:18px}
+.step h3{font-size:1.25rem;margin-bottom:6px}.step p{color:var(--mute)}
+.band{border-radius:28px;padding:54px 34px;text-align:center;border:1px solid rgba(122,92,255,.4);background:radial-gradient(70% 120% at 50% 0%,rgba(122,92,255,.35),rgba(45,226,255,.06))}
+.band h2{margin:0 auto 12px;max-width:none}.band p{color:var(--mute);margin-bottom:26px}
+.soc{display:grid;gap:12px;max-width:640px}
+.s{display:flex;align-items:center;gap:18px;padding:18px 22px;border-radius:16px;border:1px solid var(--line);background:rgba(255,255,255,.03);border-left:4px solid var(--c);transition:transform .2s,background .2s}
+.s:hover{transform:translateX(6px);background:rgba(255,255,255,.07)}
+.s small{display:block;color:var(--mute);font-size:.82rem}.s strong{font-size:1.05rem}
+.s em{margin-left:auto;font-style:normal;color:var(--c);font-weight:700;font-size:.9rem}
+footer{border-top:1px solid var(--line);padding:30px 0;color:var(--mute);font-size:.9rem}
+footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+@media(max-width:860px){.hero{grid-template-columns:1fr;padding-top:40px}.bt,.bt.big{grid-column:span 6}.steps{grid-template-columns:1fr}.steps:before{display:none}.links a:not(.btn){display:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;opacity:1!important;transform:none!important}}
+</style></head><body>
+<nav><div class="wrap"><a class="brand" href="/"><i>🛡️</i>ISS Security</a>
+<div class="links"><a href="#features">Features</a><a href="#how">How it works</a><a href="#connect">Connect</a><a class="btn" href="/client-login" style="padding:9px 20px;color:#04101c">Client Portal</a></div></div></nav>
+
+<main class="wrap">
+<header class="hero">
+<div>
+<h1 class="in">Your clients' security,<span>managed in one place.</span></h1>
+<p class="in">ISS gives your team licenses, client dashboards, support tickets and Discord control in a single platform, so protection stays organized and clients stay informed.</p>
+<div class="cta in"><a class="btn" href="/client-login">Open Client Portal</a><a class="btn ghost" href="https://discord.gg/mxRgm2R3ud" target="_blank" rel="noopener noreferrer">Join our Discord</a></div>
+</div>
+<div class="radar" aria-hidden="true">
+<div class="sweep"></div>
+<i class="b" style="top:20%;left:70%;animation-delay:.55s"></i><i class="b" style="top:70%;left:76%;animation-delay:1.7s"></i><i class="b" style="top:78%;left:24%;animation-delay:2.8s"></i><i class="b" style="top:30%;left:18%;animation-delay:3.7s"></i>
+<div class="shield"><svg width="112" height="112" viewBox="0 0 24 24" fill="none"><path d="M12 2.5l8 3v6c0 5-3.4 8.6-8 10-4.6-1.4-8-5-8-10v-6l8-3z" fill="rgba(45,226,255,.16)" stroke="#2de2ff" stroke-width="1.4" stroke-linejoin="round"/><path d="M8.3 12.2l2.7 2.7 4.9-5.4" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+<span class="chip" style="top:6%;left:-4%">Protection active</span><span class="chip" style="bottom:8%;right:-3%">Discord alerts on</span>
+</div>
+</header>
+
+<section id="features"><h2>Everything you need to run client security</h2><p class="sub">Built for security providers who want fewer spreadsheets and faster answers.</p>
+<div class="bento">
+<div class="bt big"><h3>License management</h3><p>Create a license with a plan and expiry date, hand over the login, and delete it when the contract ends.</p>
+<div class="rows"><div class="row"><span>KEY-••••••••A1</span><span class="pill">Active</span></div><div class="row"><span>KEY-••••••••7F</span><span class="pill v">Pro Plan</span></div><div class="row"><span>KEY-••••••••C9</span><span class="pill c">Enterprise</span></div></div></div>
+<div class="bt"><h3>Client portal</h3><p>Every client signs in to their own dashboard and sees their plan, expiry and protection status.</p></div>
+<div class="bt"><h3>Support tickets</h3><p>Clients open a ticket and your team replies in the same thread until it is closed.</p></div>
+<div class="bt"><h3>Discord control</h3><p>Run /newlicense, /tickets and /report right from your server and get alerts in your channel.</p></div>
+<div class="bt"><h3>Safer sign-in</h3><p>Passwords are hashed, login attempts are limited and every form is protected against forgery.</p></div>
+</div></section>
+
+<section id="how"><h2>Up and running in three steps</h2><p class="sub">No installs for your clients, only a browser.</p>
+<div class="steps">
+<div class="step"><b>1</b><h3>Get a license</h3><p>Ask our team on Discord and receive your key, username and password.</p></div>
+<div class="step"><b>2</b><h3>Sign in</h3><p>Open the Client Portal and enter your license key and login.</p></div>
+<div class="step"><b>3</b><h3>Stay covered</h3><p>Check your status any time and open a ticket if you need help.</p></div>
+</div></section>
+
+<section><div class="band"><h2>Ready to get a license?</h2><p>Tell us about your organization on Discord and we will set you up.</p><a class="btn" href="https://discord.gg/mxRgm2R3ud" target="_blank" rel="noopener noreferrer">Join our Discord</a></div></section>
+
+<section id="connect"><h2>Find Muhib online</h2><p class="sub">Questions, projects or just saying hello, pick your platform.</p>
+<div class="soc">
+<a class="s" style="--c:#ff4f8b" href="https://instagram.com/mrshadow6000" target="_blank" rel="noopener noreferrer"><div><small>Instagram</small><strong>mrshadow6000</strong></div><em>Follow</em></a>
+<a class="s" style="--c:#7a8cff" href="https://discord.gg/mxRgm2R3ud" target="_blank" rel="noopener noreferrer"><div><small>Discord</small><strong>ISS community server</strong></div><em>Join</em></a>
+<a class="s" style="--c:#3b9cff" href="https://www.linkedin.com/search/results/people/?keywords=Muhib%20Ibrahim" target="_blank" rel="noopener noreferrer"><div><small>LinkedIn</small><strong>Muhib Ibrahim</strong></div><em>Connect</em></a>
+<a class="s" style="--c:#c9d4f0" href="https://github.com/muhibibrahim-6" target="_blank" rel="noopener noreferrer"><div><small>GitHub</small><strong>muhibibrahim-6</strong></div><em>Follow</em></a>
+<a class="s" style="--c:#3dffb0" href="https://medium.com/@Muhibibrahim" target="_blank" rel="noopener noreferrer"><div><small>Medium</small><strong>@Muhibibrahim</strong></div><em>Read</em></a>
+</div></section>
+</main>
+
+<footer><div class="wrap"><span>© 2026 ISS Enterprise & Cloud Security</span><span><a href="/client-login">Client login</a> &nbsp;·&nbsp; <a href="/admin">Admin</a></span></div></footer>
+<script>
+document.querySelectorAll('.bt').forEach(function(c){c.addEventListener('pointermove',function(e){var r=c.getBoundingClientRect();c.style.setProperty('--x',(e.clientX-r.left)+'px');c.style.setProperty('--y',(e.clientY-r.top)+'px')})});
+</script>
+</body></html>
+'''
+
+
 @app.route("/")
 def home():
-    return page("ISS Security", """
-    <div style="text-align:center;padding:40px">
-      <h1>🛡️ ISS Enterprise & Cloud Security Platform</h1>
-      <p>System status: Active & Secured</p><br>
-      <a class="btn" href="/client-login">Client Portal</a>
-      <a class="btn btn2" href="/admin">Admin Panel</a>
-    </div>""")
+    return Response(LANDING_HTML, mimetype="text/html")
 
 
 # ------------------------------------------------------------------
