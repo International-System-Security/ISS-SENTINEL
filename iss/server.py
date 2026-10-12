@@ -1,5 +1,8 @@
+import io
 import os
 import sys
+import json
+import hashlib
 import base64
 import asyncio
 import secrets
@@ -13,7 +16,9 @@ from discord import app_commands
 from discord.ext import commands
 from typing import Literal
 from flask import (Flask, Response, send_from_directory, render_template_string, request, redirect,
-                   url_for, session, abort, g)
+                   url_for, session, abort, g, flash)
+from markupsafe import escape
+from PIL import Image, ImageDraw, ImageFont
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -29,6 +34,7 @@ except Exception:
 app = Flask(__name__)
 app.secret_key = os.environ["FLASK_SECRET_KEY"]
 app.config.update(
+    MAX_CONTENT_LENGTH=6 * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
@@ -78,11 +84,26 @@ def init_db():
     CREATE TABLE IF NOT EXISTS tickets(
         id INTEGER PRIMARY KEY AUTOINCREMENT, license_key TEXT,
         subject TEXT, status TEXT DEFAULT 'open', created TEXT);
+    CREATE TABLE IF NOT EXISTS devices(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, license_key TEXT, device_id TEXT,
+        name TEXT, first_seen TEXT, last_seen TEXT, UNIQUE(license_key, device_id));
+    CREATE TABLE IF NOT EXISTS threats(hash TEXT PRIMARY KEY, name TEXT, added TEXT);
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, name TEXT, password_hash TEXT, created TEXT);
+    CREATE TABLE IF NOT EXISTS agents(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, email TEXT UNIQUE, password_hash TEXT, created TEXT);
+    CREATE TABLE IF NOT EXISTS certificates(id INTEGER PRIMARY KEY AUTOINCREMENT, cert_id TEXT UNIQUE, name TEXT, email TEXT, org TEXT,
+        country TEXT, phone TEXT, discord TEXT, role TEXT, valid_from TEXT, valid_to TEXT, status TEXT DEFAULT 'valid',
+        pixel_hash TEXT, png BLOB, verified_count INTEGER DEFAULT 0, created TEXT);
+    CREATE TABLE IF NOT EXISTS commands(id INTEGER PRIMARY KEY AUTOINCREMENT, license_key TEXT, type TEXT, created TEXT);
+    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, license_key TEXT, device_id TEXT, command_id INTEGER, type TEXT, detail TEXT, created TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     CREATE TABLE IF NOT EXISTS ticket_messages(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER,
         sender TEXT, body TEXT, created TEXT);
     """)
+    try:
+        conn.execute("ALTER TABLE licenses ADD COLUMN must_change INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     if not conn.execute("SELECT 1 FROM admins WHERE email=?", (OWNER_EMAIL,)).fetchone():
         conn.execute("INSERT INTO admins VALUES(?,?,?)",
                      (OWNER_EMAIL, OWNER_USERNAME, generate_password_hash(OWNER_PASSWORD)))
@@ -128,9 +149,12 @@ def csrf_token():
 app.jinja_env.globals["csrf"] = csrf_token
 
 
+CSRF_EXEMPT = ("/scan", "/api/activate", "/api/agent/poll", "/api/agent/event", "/api/agent/threats")
+
+
 @app.before_request
 def check_csrf():
-    if request.method == "POST":
+    if request.method == "POST" and request.path not in CSRF_EXEMPT:
         sent = request.form.get("csrf", "")
         if not sent or not secrets.compare_digest(sent, session.get("csrf", "")):
             abort(400, "Invalid CSRF token")
@@ -156,8 +180,65 @@ def client_required(f):
             session.pop("client_license", None)
             return redirect(url_for("client_login"))
         g.lic = lic
+        if lic["must_change"] and request.endpoint not in ("client_account", "client_logout"):
+            flash("For your security, please change the default username and password first.")
+            return redirect(url_for("client_account"))
         return f(*a, **kw)
     return wrapper
+
+
+# ------------------------------------------------------------------
+# Plans (devices: 0 = Unlimited)
+# ------------------------------------------------------------------
+PLANS = {
+    "Basic Plan": {"devices": 2, "monthly": "$4.99", "yearly": "$49.99", "for": "Individuals, freelancers and home offices.",
+                   "features": ["Real-time cloud threat scanning and instant alerts", "Automated license management", "Secure server protection"]},
+    "Standard Plan": {"devices": 5, "monthly": "$11.99", "yearly": "$119.99", "for": "Small teams and startups.",
+                      "features": ["Everything in Basic", "Centralized organization monitoring", "Expiration tracking and renewal alerts"]},
+    "Pro Plan": {"devices": 10, "monthly": "$21.99", "yearly": "$219.99", "for": "Growing businesses and offices.",
+                 "features": ["Everything in Standard", "Priority cloud server response", "Dedicated threat definitions and instant blocking"]},
+    "Enterprise Plan": {"devices": 0, "monthly": "$50.00", "yearly": "$510.00", "for": "Large organizations with many devices.",
+                        "features": ["Everything in Pro", "Unlimited devices", "Custom requirements and dedicated support"]},
+}
+
+
+def plans_html():
+    cards = ""
+    for name, p in PLANS.items():
+        dev = "Unlimited devices" if p["devices"] == 0 else "Up to %d devices" % p["devices"]
+        li = "".join("<li>%s</li>" % x for x in p["features"])
+        cards += ('<div class="plan"><h3>%s</h3><div class="dev">%s</div><div class="price">%s<small> / month</small></div>'
+                  '<div style="color:var(--mute);font-size:.8rem">%s / year (save about 15%%)</div>'
+                  '<p style="color:var(--mute);font-size:.82rem;margin:10px 0 0">%s</p><ul>%s</ul></div>'
+                  % (name, dev, p["monthly"], p["yearly"], p["for"], li))
+    return ('<section id="plans"><h2>Plans and pricing.</h2><p class="sub">Every plan includes the ISS cloud portal and agent. '
+            'To purchase any plan, contact us through our social links or on Discord.</p><div class="plans">' + cards + '</div>'
+            '<h2 style="margin-top:70px">How to buy safely.</h2><p class="sub">Follow these steps so you only ever buy from the official ISS team.</p>'
+            '<ol class="guide"><li>Join our official <a href="https://discord.gg/mxRgm2R3ud" target="_blank" rel="noopener noreferrer" style="color:var(--cy)">Discord server</a>.</li>'
+            '<li>Open the <b>ISS Cyber Defence Suite</b> category.</li><li>Click <b>Buy Now</b>.</li>'
+            '<li>Before paying, ask the seller for their <b>Trade Certificate</b> image.</li>'
+            '<li>Open <a href="/verify" style="color:var(--cy)">Verify Certificate</a> on this website and upload that image.</li>'
+            '<li>A green tick means the seller is a verified member of our team. A red cross means the certificate is fake.</li></ol>'
+            '<div class="warn"><mark>Do not buy any other way.</mark> Anyone who cannot show a Trade Certificate that passes verification '
+            'is <mark>not part of our team</mark>, and you may be scammed.</div>'
+            '<h2 style="margin-top:70px">Our promise.</h2><p class="guide">ISS never creates, spreads or tolerates malware to drive sales. '
+            'We only use the harmless, industry-standard EICAR test file to let you check that your protection works. '
+            'Our business grows by protecting customers, never by endangering them.</p></section>')
+
+
+def plan_devices(plan):
+    return PLANS.get(plan, {}).get("devices", 2)
+
+
+def device_limit(lic):
+    try:
+        return int(lic["max_devices"] or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def limit_text(n):
+    return "Unlimited" if n == 0 else str(n)
 
 
 # ------------------------------------------------------------------
@@ -184,15 +265,49 @@ LAYOUT = """
 """
 
 
+PORTAL_LAYOUT = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} | ISS</title>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#07090c;--panel:#0c1117;--line:#1d2a35;--txt:#dce6ee;--mute:#7f93a3;--cy:#00d9ff;--am:#ffb224;--ok:#5dffb4}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:400 15px/1.6 'JetBrains Mono',monospace;padding:22px;background-image:linear-gradient(rgba(0,217,255,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,217,255,.04) 1px,transparent 1px);background-size:56px 56px}
+.wrap{max-width:940px;margin:auto}
+h1,h2,h3{font-family:'Chakra Petch',sans-serif;margin:0 0 8px}
+a{color:var(--cy)}
+.card{position:relative;background:var(--panel);border:1px solid var(--line);padding:22px;margin:16px 0}
+.card:before{content:"";position:absolute;top:-1px;left:-1px;width:16px;height:16px;border:2px solid var(--cy);border-right:0;border-bottom:0}
+input,select,textarea{width:100%;padding:11px;margin:5px 0;background:#05080b;border:1px solid var(--line);color:var(--txt);font:inherit}
+button,.btn{background:var(--cy);color:#001014;padding:11px 20px;border:0;font:700 .9rem 'Chakra Petch',sans-serif;cursor:pointer;text-decoration:none;display:inline-block}
+.btn2{background:transparent;color:var(--txt);border:1px solid var(--mute)}
+table{width:100%;border-collapse:collapse}td,th{padding:9px 6px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
+th{color:var(--mute);font-weight:400}
+.ok{color:var(--ok)}.err{color:#ff8a8a}.m{color:var(--mute);font-size:.85rem}
+.me{background:#0a2a35;padding:8px;margin:6px 0}.them{background:#141c24;padding:8px;margin:6px 0}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.status{display:inline-flex;align-items:center;gap:10px;padding:6px 14px;border:1px solid var(--ok);color:var(--ok);font-weight:700}
+.dot{width:10px;height:10px;background:var(--ok);border-radius:50%;box-shadow:0 0 12px var(--ok);animation:p 1.6s infinite}
+@keyframes p{50%{opacity:.35}}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.big{font:700 2.6rem 'Chakra Petch',sans-serif}.big small{font-size:1rem;color:var(--mute)}
+.meter{height:8px;background:var(--line);margin:10px 0}.meter i{display:block;height:100%;background:var(--cy)}
+tr.cur td{color:var(--am)}
+code{color:var(--am)}
+button.status{background:transparent;cursor:pointer;font:700 1rem 'JetBrains Mono',monospace;color:var(--ok)}.res{text-align:center;padding:34px}.res .mark{font-size:5rem;line-height:1}.res.okc .mark{color:var(--ok)}.res.bad .mark{color:#ff5d5d}.pill{display:inline-block;padding:2px 10px;border:1px solid var(--line);font-size:.75rem}.pill.g{color:var(--ok);border-color:var(--ok)}.pill.r{color:#ff8a8a;border-color:#ff8a8a}
+@media(max-width:700px){.g2{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">{% for m in get_flashed_messages() %}<div class="card ok" style="padding:12px 18px">{{ m }}</div>{% endfor %}{{ body|safe }}</div></body></html>"""
+
+
 def page(title, body_tpl, **ctx):
     body = render_template_string(body_tpl, **ctx)
-    return render_template_string(LAYOUT, title=title, body=body)
+    layout = PORTAL_LAYOUT
+    return render_template_string(layout, title=title, body=body)
 
 
 # ------------------------------------------------------------------
 # Home
 # ------------------------------------------------------------------
-BUILD = "v5-onefile-2026-10-11"
+BUILD = "v7-accounts-certs-2026-10-12"
 
 LANDING_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -262,9 +377,10 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
 .term{border:1px solid var(--line);background:#05080b;max-width:820px;margin:0 auto;box-shadow:0 0 60px rgba(0,217,255,.08)}.tbar{display:flex;gap:7px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);font-size:.72rem;color:var(--mute)}.tbar i{width:9px;height:9px;background:var(--line);display:block}.tbar i:first-child{background:var(--am)}.tbar span{margin-left:10px}#tout{padding:20px 18px;min-height:310px;font:400 .82rem/1.75 'JetBrains Mono',monospace;color:#a8f3ff;white-space:pre-wrap;overflow-x:auto}#tout .p{color:var(--am)}#tout .g{color:#5dffb4}#tout .m{color:var(--mute)}.brand img{height:38px;width:auto}.brand span{font-size:1rem}.lock{display:flex;align-items:center;gap:16px;margin-bottom:34px}.lock img{height:92px;width:auto;filter:drop-shadow(0 0 20px rgba(124,92,255,.55))}.lock b{display:block;font:700 1.05rem 'Chakra Petch';letter-spacing:.03em}.lock span{display:block;color:var(--am);font-size:.76rem;margin-top:2px}.seq4{grid-template-columns:repeat(4,1fr)}.seq4 div{padding:24px}
 @media(max-width:860px){.brand span{display:none}.seq4{grid-template-columns:1fr}.hero{grid-template-columns:1fr;padding-top:40px}.grid,.seq{grid-template-columns:1fr}.seq div{border-right:0;border-bottom:1px solid var(--line)}.links a:not(.btn){display:none}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.plans{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.plan{background:var(--panel);border:1px solid var(--line);padding:26px 22px}.plan h3{font-size:1.3rem}.plan .price{font:700 2rem 'Chakra Petch',sans-serif;color:var(--cy);margin-top:10px}.plan .price small{font-size:.8rem;color:var(--mute)}.plan ul{list-style:none;padding:0;margin:16px 0 0;font-size:.82rem;color:var(--mute)}.plan li{padding:7px 0;border-top:1px solid var(--line)}.plan .dev{color:var(--am);font-size:.85rem}.warn{border:1px solid var(--am);background:rgba(255,178,36,.08);padding:18px 22px;margin:22px 0;font-size:.92rem}.warn mark,.guide mark{background:rgba(255,178,36,.25);color:#fff;padding:0 4px}.guide{max-width:760px;font-size:.92rem;color:var(--mute)}.guide li{margin:10px 0}.links form{display:inline;margin:0}@media(max-width:1000px){.plans{grid-template-columns:1fr 1fr}}@media(max-width:600px){.plans{grid-template-columns:1fr}}
 </style></head><body>
 <nav><div class="wrap"><a class="brand" href="#"><img src="/shield.webp" alt="ISS logo"><span>International System Security</span></a>
-<div class="links"><a href="#services">Services</a><a href="#platform">Platform</a><a href="#deploy">Deploy</a><a href="#connect">Connect</a><a class="btn" href="/client-login" style="padding:9px 20px;font-size:.85rem">Client Portal</a></div></div></nav>
+<div class="links"><a href="#services">Services</a><a href="#plans">Plans</a><a href="/verify">Verify</a><a href="#connect">Connect</a>__AUTHNAV__<a class="btn" href="/client-login" style="padding:9px 20px;font-size:.85rem">Client Portal</a></div></div></nav>
 
 <main class="wrap">
 <header class="hero">
@@ -305,6 +421,8 @@ footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
 <div><b>step 2</b><h3>Authenticate</h3><p>Open the Client Portal and sign in with your license key.</p></div>
 <div><b>step 3</b><h3>Operate</h3><p>Check your status and open a ticket whenever you need support.</p></div>
 </div></section>
+
+__PLANS__
 
 <section><div class="band card"><h2>Need a license?</h2><p>Tell us about your organization on Discord and we will set you up.</p><a class="btn" href="https://discord.gg/mxRgm2R3ud" target="_blank" rel="noopener noreferrer">Join Discord</a></div></section>
 
@@ -360,7 +478,7 @@ if('IntersectionObserver' in window){new IntersectionObserver(function(e){if(e[0
 
 @app.route("/")
 def home():
-    resp = Response(LANDING_HTML.replace("__BUILD__", BUILD), mimetype="text/html")
+    resp = Response(LANDING_HTML.replace("__BUILD__", BUILD).replace("__AUTHNAV__", auth_nav()).replace("__PLANS__", plans_html()), mimetype="text/html")
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -895,24 +1013,24 @@ def admin_panel():
             org = request.form.get("l_org", "").strip()
             plan = request.form.get("l_plan", "Basic Plan").strip()
             expiry = request.form.get("l_expiry", "").strip() or "2027-01-01"
-            user = request.form.get("l_user", "").strip()
-            pwd = request.form.get("l_pwd", "")
+            user = request.form.get("l_user", "").strip() or "admin"
+            pwd = request.form.get("l_pwd", "") or "admin"
             try:
                 date.fromisoformat(expiry)
             except ValueError:
                 msg = "❌ Invalid expiry date (use YYYY-MM-DD)"
             else:
-                if not (name and org and user and len(pwd) >= 8):
-                    msg = "❌ Fill all fields (password min 8 chars)"
+                if not (name and org):
+                    msg = "❌ Client name and organization are required"
                 elif db.execute("SELECT 1 FROM licenses WHERE key=?", (key,)).fetchone():
                     msg = "❌ License key already exists"
                 else:
-                    db.execute("INSERT INTO licenses VALUES(?,?,?,?,?,?,?,?,?)",
-                               (key, name, org, expiry, 5, plan, user,
-                                generate_password_hash(pwd), now()))
+                    db.execute("INSERT INTO licenses(key,name,org,expiry,max_devices,plan,client_user,client_pwd_hash,created,must_change) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                               (key, name, org, expiry, plan_devices(plan), plan, user,
+                                generate_password_hash(pwd), now(), 1 if pwd == "admin" else 0))
                     db.commit()
                     send_discord_alert(f"🔑 New license `{key}` | **{name}** ({org}) | {plan}")
-                    msg = f"✅ License '{key}' created"
+                    msg = f"✅ License '{key}' created. Client login: {user} / {pwd} (they must change it at first login)"
         elif action == "delete_license":
             db.execute("DELETE FROM licenses WHERE key=?", (request.form.get("key", ""),))
             db.commit()
@@ -932,12 +1050,12 @@ def admin_panel():
             else:
                 msg = "❌ Invalid admin data (password min 8 chars)"
 
-    licenses = db.execute("SELECT * FROM licenses ORDER BY created DESC").fetchall()
+    licenses = db.execute("SELECT l.*, (SELECT COUNT(*) FROM devices d WHERE d.license_key=l.key) AS used FROM licenses l ORDER BY created DESC").fetchall()
     open_tickets = db.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0]
     return page("Admin Panel", """
     <h2>🛡️ Admin Panel</h2>
     <a href="/">&larr; Home</a> |
-    <a href="/admin/tickets">Support Tickets ({{ open_tickets }} open)</a>
+    <a href="/admin/tickets">Support Tickets ({{ open_tickets }} open)</a> | <a href="/admin/certificates">Certificates &amp; Agents</a>
     <form method="POST" action="/admin-logout" style="display:inline;float:right">
       <input type="hidden" name="csrf" value="{{ csrf() }}"><button class="btn2">Logout</button></form>
     {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
@@ -948,18 +1066,18 @@ def admin_panel():
         <input name="l_key" placeholder="License Key (empty = auto generate)">
         <input name="l_name" placeholder="Client Name" required>
         <input name="l_org" placeholder="Organization" required>
-        <select name="l_plan"><option>Basic Plan</option><option>Pro Plan</option><option>Enterprise Plan</option></select>
+        <select name="l_plan"><option>Basic Plan</option><option>Standard Plan</option><option>Pro Plan</option><option>Enterprise Plan</option></select>
         <input name="l_expiry" placeholder="Expiry YYYY-MM-DD (default 2027-01-01)">
-        <input name="l_user" placeholder="Client username" required>
-        <input name="l_pwd" type="password" placeholder="Client password (min 8)" required>
+        <input name="l_user" placeholder="Client username (empty = admin)">
+        <input name="l_pwd" type="password" placeholder="Client password (empty = admin)">
         <button type="submit">Create License & Notify Discord</button>
       </form></div>
 
     <div class="card"><h3>Licenses</h3>
-      <table><tr><th>Key</th><th>Client</th><th>Org</th><th>Plan</th><th>Expiry</th><th></th></tr>
+      <table><tr><th>Key</th><th>Client</th><th>Org</th><th>Plan</th><th>Devices</th><th>Expiry</th><th></th></tr>
       {% for l in licenses %}<tr>
         <td><code>{{ l.key }}</code></td><td>{{ l.name }}</td><td>{{ l.org }}</td>
-        <td>{{ l.plan }}</td><td>{{ l.expiry }}</td>
+        <td>{{ l.plan }}</td><td>{{ l.used }}/{{ 'Unlimited' if l.max_devices|int == 0 else l.max_devices }}</td><td>{{ l.expiry }}</td>
         <td><form method="POST" onsubmit="return confirm('Delete?')">
           <input type="hidden" name="csrf" value="{{ csrf() }}">
           <input type="hidden" name="action" value="delete_license">
@@ -1053,29 +1171,157 @@ def client_login():
       <br><a href="/">&larr; Home</a></div>""", err=err)
 
 
+DASH_TPL = r"""
+<div class="top"><h2>ISS Client Portal</h2><div>
+  <a class="btn btn2" href="/client/account">Account</a>
+  <form method="POST" action="/client-logout" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf() }}"><button class="btn2">Logout</button></form></div></div>
+<div class="card">
+  <form method="POST" action="/client/activate-device" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf() }}">
+    <button class="status" type="submit"><span class="dot"></span>Active now</button></form>
+  <span class="m">&nbsp;Press to add this device to your license.</span>
+  <h1 style="margin-top:14px">{{ v.org }}</h1>
+  <p class="m">{{ v.plan }} &middot; expires {{ v.expiry }} ({{ days }} days left)</p>
+</div>
+<div class="g2">
+  <div class="card"><h3>Device slots</h3>
+    <div class="big">{{ used }} <small>of {{ limit_text }}</small></div>
+    {% if limit %}<div class="meter"><i style="width:{{ pct }}%"></i></div>{% endif %}
+    <p class="m">{% if limit and used >= limit %}All slots are in use. Remove a device or upgrade your plan.{% elif limit %}{{ limit - used }} more device(s) can be added.{% else %}This plan has no device limit.{% endif %}</p></div>
+  <div class="card"><h3>Setup</h3>
+    <p class="m">Put config.json in your ISS agent folder and start the agent. Devices register themselves.</p>
+    <a class="btn" href="/client/config.json">Download config.json</a>
+    <p class="m">License key: <code>{{ v.key }}</code></p></div>
+</div>
+<div class="card"><h3>Protection test</h3>
+  <p class="m">Runs the industry-standard EICAR test file. Every active device shows a pop-up and quarantines it exactly like a real threat.</p>
+  {% if used == 0 %}<button disabled style="opacity:.4;cursor:not-allowed">Test</button> <span class="m">Activate a device first.</span>
+  {% else %}<form method="POST" action="/client/test"><input type="hidden" name="csrf" value="{{ csrf() }}"><button type="submit">Test</button></form>{% endif %}
+  {% if events %}<table style="margin-top:14px"><tr><th>Time (UTC)</th><th>Device</th><th>Result</th></tr>
+  {% for e in events %}<tr><td>{{ e.created }}</td><td>{{ e.dname or 'Unknown' }}</td><td>
+    {% if e.type == 'test_blocked' %}<span class="pill g">Test virus blocked</span>{% elif e.type == 'test_missed' %}<span class="pill r">Test virus NOT blocked</span>{% else %}<span class="pill g">Threat blocked</span> {{ e.detail }}{% endif %}</td></tr>{% endfor %}</table>{% endif %}</div>
+<div class="card"><h3>Registered devices</h3>
+  {% if devices %}<table><tr><th>Device</th><th>Status</th><th>Last seen (UTC)</th><th></th></tr>
+  {% for d in devices %}<tr><td>{{ d.name }}</td><td>{% if d.online %}<span class="pill g">online</span>{% else %}<span class="pill">offline</span>{% endif %}</td><td>{{ d.last_seen }}</td>
+    <td><form method="POST" action="/client/devices/remove" onsubmit="return confirm('Remove this device?')">
+      <input type="hidden" name="csrf" value="{{ csrf() }}"><input type="hidden" name="id" value="{{ d.id }}"><button class="btn2">Remove</button></form></td></tr>{% endfor %}</table>
+  {% else %}<p class="m">No device yet. Press "Active now" or start the ISS agent on a PC.</p>{% endif %}</div>
+<div class="card"><h3>Plans</h3><table><tr><th>Plan</th><th>Devices</th><th>Monthly</th><th>Yearly</th></tr>
+  {% for name, p in plans.items() %}<tr {% if name == v.plan %}class="cur"{% endif %}><td>{{ name }}</td><td>{{ 'Unlimited' if p.devices == 0 else p.devices }}</td><td>{{ p.monthly }}</td><td>{{ p.yearly }}</td></tr>{% endfor %}</table>
+  <p class="m">To change plan or for custom needs, open a support ticket below.</p></div>
+<div class="card"><h3>New support ticket</h3>
+  <form method="POST" action="/client/tickets/new"><input type="hidden" name="csrf" value="{{ csrf() }}">
+    <input name="subject" placeholder="Subject" maxlength="120" required>
+    <textarea name="body" rows="3" placeholder="Describe your problem" required></textarea>
+    <button type="submit">Submit ticket</button></form></div>
+<div class="card"><h3>My tickets</h3><table>
+  {% for t in tickets %}<tr><td><a href="/client/tickets/{{ t.id }}">#{{ t.id }}</a></td><td>{{ t.subject }}</td><td>{{ t.status }}</td><td>{{ t.created }}</td></tr>{% endfor %}</table></div>
+"""
+
+
+def is_online(last_seen):
+    try:
+        return (datetime.utcnow() - datetime.strptime(last_seen, "%Y-%m-%d %H:%M")).total_seconds() < 240
+    except (TypeError, ValueError):
+        return False
+
+
 @app.route("/client-dashboard")
 @client_required
 def client_dashboard():
-    tickets = get_db().execute("SELECT * FROM tickets WHERE license_key=? ORDER BY id DESC",
-                               (g.lic["key"],)).fetchall()
-    return page("Client Dashboard", """
-    <h2>🛡️ Client Security Dashboard</h2>
-    <form method="POST" action="/client-logout" style="float:right">
-      <input type="hidden" name="csrf" value="{{ csrf() }}"><button class="btn2">Logout</button></form>
-    <p>Organization: <b>{{ v.org }}</b> | Plan: {{ v.plan }} | Expiry: {{ v.expiry }}</p>
-    <p>License: <code>{{ v.key }}</code></p>
-    <p class="ok">Protection Status: <b>Active & Secured</b></p>
+    db = get_db()
+    key = g.lic["key"]
+    tickets = db.execute("SELECT * FROM tickets WHERE license_key=? ORDER BY id DESC", (key,)).fetchall()
+    devices = [dict(d, online=is_online(d["last_seen"])) for d in db.execute("SELECT * FROM devices WHERE license_key=? ORDER BY last_seen DESC", (key,)).fetchall()]
+    events = db.execute("SELECT e.*, d.name AS dname FROM events e LEFT JOIN devices d ON d.device_id=e.device_id AND d.license_key=e.license_key WHERE e.license_key=? ORDER BY e.id DESC LIMIT 10", (key,)).fetchall()
+    limit = device_limit(g.lic)
+    used = len(devices)
+    pct = min(100, int(used * 100 / limit)) if limit else 0
+    try:
+        days = (date.fromisoformat(g.lic["expiry"]) - date.today()).days
+    except ValueError:
+        days = 0
+    return page("Client Dashboard", DASH_TPL, v=g.lic, tickets=tickets, devices=devices, events=events,
+                limit=limit, limit_text=limit_text(limit), used=used, pct=pct, days=days, plans=PLANS)
 
-    <div class="card"><h3>New Support Ticket</h3>
-      <form method="POST" action="/client/tickets/new"><input type="hidden" name="csrf" value="{{ csrf() }}">
-        <input name="subject" placeholder="Subject" maxlength="120" required>
-        <textarea name="body" rows="3" placeholder="Describe your problem" required></textarea>
-        <button type="submit">Submit Ticket</button></form></div>
 
-    <div class="card"><h3>My Tickets</h3><table>
-      {% for t in tickets %}<tr><td><a href="/client/tickets/{{ t.id }}">#{{ t.id }}</a></td>
-        <td>{{ t.subject }}</td><td>{{ t.status }}</td><td>{{ t.created }}</td></tr>{% endfor %}
-    </table></div>""", v=g.lic, tickets=tickets)
+@app.route("/client/devices/remove", methods=["POST"])
+@client_required
+def client_device_remove():
+    db = get_db()
+    db.execute("DELETE FROM devices WHERE id=? AND license_key=?",
+               (request.form.get("id", ""), g.lic["key"]))
+    db.commit()
+    return redirect(url_for("client_dashboard"))
+
+
+@app.route("/client/config.json")
+@client_required
+def client_config():
+    body = json.dumps({"license_key": g.lic["key"]}, indent=2)
+    return Response(body, mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=config.json"})
+
+
+# ------------------------------------------------------------------
+# Agent API: লাইসেন্স ও ডিভাইস সীমা যাচাই
+# ------------------------------------------------------------------
+def api_authorize(data):
+    key = str(data.get("license_key", "")).strip()
+    dev = str(data.get("device_id", "")).strip()[:64]
+    name = str(data.get("device_name", "")).strip()[:60]
+    if not key or not dev:
+        return None, ({"status": "error", "message": "license_key and device_id are required"}, 400)
+    conn = connect()
+    try:
+        lic = conn.execute("SELECT * FROM licenses WHERE key=?", (key,)).fetchone()
+        if not lic:
+            return None, ({"status": "denied", "message": "Invalid license key"}, 403)
+        if lic["expiry"] < date.today().isoformat():
+            return None, ({"status": "denied", "message": "License expired. Please renew."}, 403)
+        limit = device_limit(lic)
+        used = conn.execute("SELECT COUNT(*) FROM devices WHERE license_key=?", (key,)).fetchone()[0]
+        known = conn.execute("SELECT 1 FROM devices WHERE license_key=? AND device_id=?", (key, dev)).fetchone()
+        if known:
+            conn.execute("UPDATE devices SET last_seen=?, name=COALESCE(NULLIF(?, ''), name) WHERE license_key=? AND device_id=?",
+                         (now(), name, key, dev))
+        elif limit and used >= limit:
+            return None, ({"status": "denied",
+                           "message": f"Device limit reached ({used} of {limit}). Remove a device in the Client Portal or upgrade your plan."}, 403)
+        else:
+            conn.execute("INSERT INTO devices(license_key,device_id,name,first_seen,last_seen) VALUES(?,?,?,?,?)",
+                         (key, dev, name or "Unnamed PC", now(), now()))
+            used += 1
+        conn.commit()
+        return {"lic": dict(lic), "used": used, "limit": limit, "device": name}, None
+    finally:
+        conn.close()
+
+
+@app.route("/api/activate", methods=["POST"])
+@limiter.limit("30 per minute")
+def api_activate():
+    info, err = api_authorize(request.get_json(silent=True) or {})
+    if err:
+        return err
+    return {"status": "active", "plan": info["lic"]["plan"], "expiry": info["lic"]["expiry"],
+            "devices_used": info["used"], "devices_max": limit_text(info["limit"])}
+
+
+@app.route("/scan", methods=["POST"])
+@limiter.limit("120 per minute")
+def api_scan():
+    data = request.get_json(silent=True) or {}
+    info, err = api_authorize(data)
+    if err:
+        return {"status": err[0]["status"], "message": err[0]["message"]}, err[1]
+    h = str(data.get("hash", "")).strip().lower()
+    conn = connect()
+    t = conn.execute("SELECT name FROM threats WHERE hash=?", (h,)).fetchone()
+    conn.close()
+    if t:
+        send_discord_alert(f"🚨 Threat `{t['name']}` found: {data.get('filename','file')} on {info['device']} ({info['lic']['org']})")
+        return {"status": "threat", "message": f"Threat detected: {t['name']}"}
+    return {"status": "clean", "message": "File is clean"}
 
 
 @app.route("/client-logout", methods=["POST"])
@@ -1130,171 +1376,15 @@ def client_ticket(tid):
 
 
 # ------------------------------------------------------------------
-# Health check (UptimeRobot এখানে পিং করবে, সার্ভার জেগে থাকবে)
+# Accounts: one Login for everyone, Register for customers
 # ------------------------------------------------------------------
-@app.route("/health")
-@limiter.exempt
-def health():
-    return "OK"
-
-
-# ------------------------------------------------------------------
-# Discord bot - Slash (/) কমান্ড, শুধু Administrator-দের জন্য
-# ------------------------------------------------------------------
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
-GUILD_ID = os.environ.get("DISCORD_GUILD_ID")  # ঐচ্ছিক: দিলে কমান্ড সাথে সাথে আসে
-
-
-async def _setup_hook():
-    if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
+def auth_nav():
+    small = 'style="padding:9px 16px;font-size:.85rem"'
+    if session.get("is_admin"):
+        out = f'<a class="btn" href="/admin" {small}>Admin Portal</a>'
+    elif session.get("agent_id"):
+        out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
+    elif session.get("user_id"):
+        out = f'<a class="btn line" href="/account" {small}>{escape(session.get("user_name", "Account"))}</a>'
     else:
-        await bot.tree.sync()
-
-
-bot.setup_hook = _setup_hook
-
-
-def q_one(sql, args=()):
-    conn = connect()
-    v = conn.execute(sql, args).fetchone()[0]
-    conn.close()
-    return v
-
-
-def q_all(sql, args=()):
-    conn = connect()
-    rows = conn.execute(sql, args).fetchall()
-    conn.close()
-    return rows
-
-
-def slash(name, desc):
-    def deco(fn):
-        fn = app_commands.checks.has_permissions(administrator=True)(fn)
-        fn = app_commands.default_permissions(administrator=True)(fn)
-        fn = app_commands.guild_only()(fn)
-        return bot.tree.command(name=name, description=desc)(fn)
-    return deco
-
-
-@bot.event
-async def on_ready():
-    print(f"Discord Bot logged in as {bot.user.name}")
-
-
-@bot.tree.error
-async def on_app_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = "⛔ শুধু সার্ভারের Administrator এই কমান্ড চালাতে পারবে।"
-    else:
-        print(f"Command error: {error}")
-        msg = "⚠️ কিছু একটা সমস্যা হয়েছে।"
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
-
-
-@bot.tree.command(name="report", description="সিস্টেমের বর্তমান অবস্থা")
-@app_commands.guild_only()
-async def report(interaction: discord.Interaction):
-    lic = q_one("SELECT COUNT(*) FROM licenses")
-    op = q_one("SELECT COUNT(*) FROM tickets WHERE status='open'")
-    await interaction.response.send_message(
-        f"🛡️ ISS Report: system active.\nLicenses: {lic} | Open tickets: {op}")
-
-
-@bot.tree.command(name="weekly_report", description="গত ৭ দিনের রিপোর্ট")
-@app_commands.guild_only()
-async def weekly_report(interaction: discord.Interaction):
-    since = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
-    nl = q_one("SELECT COUNT(*) FROM licenses WHERE created>=?", (since,))
-    nt = q_one("SELECT COUNT(*) FROM tickets WHERE created>=?", (since,))
-    op = q_one("SELECT COUNT(*) FROM tickets WHERE status='open'")
-    await interaction.response.send_message(
-        f"📈 ISS Weekly Report (7 days)\nNew licenses: {nl} | New tickets: {nt} | Open tickets now: {op}")
-
-
-@slash("setalert", "এই চ্যানেলে অ্যালার্ট পাঠানো শুরু করো")
-async def setalert(interaction: discord.Interaction):
-    conn = connect()
-    conn.execute("INSERT OR REPLACE INTO settings VALUES('alert_channel', ?)",
-                 (str(interaction.channel_id),))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message("✅ এখন থেকে অ্যালার্ট এই চ্যানেলে আসবে।")
-
-
-@slash("licenses", "সর্বশেষ ১৫টি লাইসেন্স দেখাও")
-async def licenses_cmd(interaction: discord.Interaction):
-    rows = q_all("SELECT key,name,org,plan,expiry FROM licenses ORDER BY created DESC LIMIT 15")
-    if not rows:
-        return await interaction.response.send_message("কোনো লাইসেন্স নেই।", ephemeral=True)
-    lines = [f"`{r['key']}` | {r['name']} ({r['org']}) | {r['plan']} | {r['expiry']}" for r in rows]
-    await interaction.response.send_message("🔑 **Licenses**\n" + "\n".join(lines), ephemeral=True)
-
-
-@slash("newlicense", "নতুন ক্লায়েন্ট লাইসেন্স তৈরি করো")
-@app_commands.describe(name="ক্লায়েন্টের নাম", org="প্রতিষ্ঠানের নাম",
-                       plan="প্ল্যান", days="কত দিনের মেয়াদ (ডিফল্ট ৩৬৫)")
-async def newlicense(interaction: discord.Interaction, name: str, org: str,
-                     plan: Literal["Basic Plan", "Pro Plan", "Enterprise Plan"] = "Basic Plan",
-                     days: app_commands.Range[int, 1, 3650] = 365):
-    key = "KEY-" + secrets.token_hex(6).upper()
-    user = "client" + secrets.token_hex(2)
-    pwd = secrets.token_urlsafe(9)
-    expiry = (date.today() + timedelta(days=days)).isoformat()
-    conn = connect()
-    conn.execute("INSERT INTO licenses VALUES(?,?,?,?,?,?,?,?,?)",
-                 (key, name, org, expiry, 5, plan, user, generate_password_hash(pwd), now()))
-    conn.commit()
-    conn.close()
-    # শুধু আপনি দেখতে পাবেন (ephemeral)
-    await interaction.response.send_message(
-        f"🔑 **নতুন লাইসেন্স** (শুধু আপনি দেখছেন)\nClient: {name} ({org}) | {plan}\n"
-        f"License Key: `{key}`\nUsername: `{user}`\nPassword: `{pwd}`\nExpiry: {expiry}\n"
-        f"⚠️ পাসওয়ার্ড আর দেখা যাবে না, এখনই ক্লায়েন্টকে দিন।", ephemeral=True)
-    send_discord_alert(f"🔑 New license `{key}` | **{name}** ({org}) | {plan}")
-
-
-@slash("deletelicense", "লাইসেন্স মুছে ফেলো")
-@app_commands.describe(key="লাইসেন্স কী, যেমন KEY-ABC123")
-async def deletelicense(interaction: discord.Interaction, key: str):
-    conn = connect()
-    cur = conn.execute("DELETE FROM licenses WHERE key=?", (key.strip(),))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(
-        "🗑️ মুছে ফেলা হয়েছে।" if cur.rowcount else "⚠️ এই কী পাওয়া যায়নি।", ephemeral=True)
-
-
-@slash("tickets", "খোলা সাপোর্ট টিকিটের তালিকা")
-async def tickets_cmd(interaction: discord.Interaction):
-    rows = q_all("""SELECT t.id,t.subject,t.created,l.org FROM tickets t
-        LEFT JOIN licenses l ON l.key=t.license_key WHERE t.status='open' ORDER BY t.id DESC LIMIT 15""")
-    if not rows:
-        return await interaction.response.send_message("✅ কোনো খোলা টিকিট নেই।")
-    lines = [f"#{r['id']} | {r['org']} | {r['subject']} | {r['created']}" for r in rows]
-    await interaction.response.send_message("🎫 **Open tickets**\n" + "\n".join(lines))
-
-
-def run_discord_bot():
-    if not BOT_TOKEN:
-        print("DISCORD_BOT_TOKEN not set - bot disabled.")
-        return
-    try:
-        asyncio.run(bot.start(BOT_TOKEN))
-    except Exception as e:
-        print(f"Bot error: {e}")
-
-
-init_db()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_discord_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)),
-            debug=os.environ.get("FLASK_DEBUG", "0") == "1", use_reloader=False)
+        return f'<a class="btn line" href="/login" {small}>Login</a><a class="btn line" href="/register" {small}>Register
