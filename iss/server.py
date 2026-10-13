@@ -18,7 +18,12 @@ from typing import Literal
 from flask import (Flask, Response, send_from_directory, render_template_string, request, redirect,
                    url_for, session, abort, g, flash)
 from markupsafe import escape
-from PIL import Image, ImageDraw, ImageFont
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:  # site still starts; only certificates are disabled
+    Image = ImageDraw = ImageFont = None
+    PIL_OK = False
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -307,7 +312,7 @@ def page(title, body_tpl, **ctx):
 # ------------------------------------------------------------------
 # Home
 # ------------------------------------------------------------------
-BUILD = "v7b-english-bot-2026-10-12"
+BUILD = "v7c-safe-start-2026-10-13"
 
 LANDING_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -961,7 +966,7 @@ def shield_img():
 
 @app.route("/version")
 def version():
-    return BUILD
+    return BUILD + (" | pillow ok" if PIL_OK else " | pillow MISSING")
 
 
 # ------------------------------------------------------------------
@@ -1385,6 +1390,4 @@ def auth_nav():
     elif session.get("agent_id"):
         out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
     elif session.get("user_id"):
-        out = f'<a class="btn line" href="/account" {small}>{escape(session.get("user_name", "Account"))}</a>'
-    else:
-        return f'<a class="btn line" href="/login" {small}>Login</a><a class="btn line" href="/register" {smal
+        out = f'<a
