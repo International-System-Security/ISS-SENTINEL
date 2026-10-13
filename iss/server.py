@@ -24,12 +24,12 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 try:
-    sys.stdout.reconfigure(line_buffering=True)  # Render লগে সাথে সাথে লেখা দেখাবে
+    sys.stdout.reconfigure(line_buffering=True)  # show logs on Render immediately
 except Exception:
     pass
 
 # ------------------------------------------------------------------
-# Config (সব সিক্রেট এনভায়রনমেন্ট ভেরিয়েবল থেকে আসবে)
+# Config (all secrets come from environment variables)
 # ------------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = os.environ["FLASK_SECRET_KEY"]
@@ -51,7 +51,7 @@ limiter = Limiter(get_remote_address, app=app,
 
 
 # ------------------------------------------------------------------
-# Database (sqlite - নিজে থেকেই তৈরি হবে)
+# Database (sqlite, created automatically)
 # ------------------------------------------------------------------
 def connect():
     conn = sqlite3.connect(DB_FILE)
@@ -116,7 +116,7 @@ def now():
 
 
 # ------------------------------------------------------------------
-# ডিসকর্ড অ্যালার্ট (বট নিজেই নির্ধারিত চ্যানেলে পাঠায়, ওয়েবহুক লাগে না)
+# Discord alerts (the bot posts to the chosen channel, no webhook needed)
 # ------------------------------------------------------------------
 def send_discord_alert(text):
     try:
@@ -307,7 +307,7 @@ def page(title, body_tpl, **ctx):
 # ------------------------------------------------------------------
 # Home
 # ------------------------------------------------------------------
-BUILD = "v7-accounts-certs-2026-10-12"
+BUILD = "v7b-english-bot-2026-10-12"
 
 LANDING_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -484,7 +484,7 @@ def home():
 
 
 # ------------------------------------------------------------------
-# লোগো ছবি (কোডের ভেতরেই আছে, আলাদা ফাইল লাগবে না)
+# Logo images (embedded in the code, no separate files needed)
 # ------------------------------------------------------------------
 LOGO_B64 = """
 UklGRlxeAABXRUJQVlA4WAoAAAAQAAAAMgEAvQAAQUxQSMIvAAAB/yckSPD/eGtEpO4TEiPJbSSpCsDdC2D8N5hihQUR/Z8A3jh8
@@ -1263,7 +1263,7 @@ def client_config():
 
 
 # ------------------------------------------------------------------
-# Agent API: লাইসেন্স ও ডিভাইস সীমা যাচাই
+# Agent API: license and device limit checks
 # ------------------------------------------------------------------
 def api_authorize(data):
     key = str(data.get("license_key", "")).strip()
@@ -1387,4 +1387,4 @@ def auth_nav():
     elif session.get("user_id"):
         out = f'<a class="btn line" href="/account" {small}>{escape(session.get("user_name", "Account"))}</a>'
     else:
-        return f'<a class="btn line" href="/login" {small}>Login</a><a class="btn line" href="/register" {small}>Register
+        return f'<a class="btn line" href="/login" {small}>Login</a><a class="btn line" href="/register" {smal
