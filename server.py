@@ -1390,7 +1390,18 @@ def auth_nav():
     elif session.get("agent_id"):
         out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
     elif session.get("user_id"):
-        out = f'<a  class="btn" href="/admin" {small}>Admin Portal</a>'
+        out = f'<a 
+# p2.py - second half of the ISS server. Loaded automatically by server.py (keep both files together).
+try:
+    PIL_OK
+except NameError:
+    PIL_OK = True
+
+
+def auth_nav():
+    small = 'style="padding:9px 16px;font-size:.85rem"'
+    if session.get("is_admin"):
+        out = f'<a class="btn" href="/admin" {small}>Admin Portal</a>'
     elif session.get("agent_id"):
         out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
     elif session.get("user_id"):
@@ -1399,12 +1410,6 @@ def auth_nav():
         return f'<a class="btn line" href="/login" {small}>Login</a><a class="btn line" href="/register" {small}>Register</a>'
     return out + (f'<form method="POST" action="/logout"><input type="hidden" name="csrf" value="{csrf_token()}">'
                   f'<button class="btn line" {small}>Logout</button></form>')
-
-
-try:
-    PIL_OK
-except NameError:
-    PIL_OK = True
 
 
 AUTH_TPL = r"""
@@ -2037,13 +2042,3 @@ def run_discord_bot():
         asyncio.run(bot.start(BOT_TOKEN))
     except Exception as e:
         print(f"Bot error: {e}")
-
-
-init_db()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_discord_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)),
-            debug=os.environ.get("FLASK_DEBUG", "0") == "1", use_reloader=False)
-
-# === END OF server.py (v7c) - if you can see this line, the file is complete ===
