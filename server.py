@@ -312,7 +312,7 @@ def page(title, body_tpl, **ctx):
 # ------------------------------------------------------------------
 # Home
 # ------------------------------------------------------------------
-BUILD = "v7d-split-2026-10-14"
+BUILD = "v7c-safe-start-2026-10-13"
 
 LANDING_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1383,16 +1383,11 @@ def client_ticket(tid):
 # ------------------------------------------------------------------
 # Accounts: one Login for everyone, Register for customers
 # ------------------------------------------------------------------
-# Load the second half of the server (p2.py must be in the same folder as server.py)
-exec(compile(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "p2.py"), encoding="utf-8").read(), "p2.py", "exec"))
-
-
-init_db()
-
-if __name__ == "__main__":
-    threading.Thread(target=run_discord_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)),
-            debug=os.environ.get("FLASK_DEBUG", "0") == "1", use_reloader=False)
-
-# === END OF server.py (v7e) - if you can see this line, the file is complete ===
- 
+def auth_nav():
+    small = 'style="padding:9px 16px;font-size:.85rem"'
+    if session.get("is_admin"):
+        out = f'<a class="btn" href="/admin" {small}>Admin Portal</a>'
+    elif session.get("agent_id"):
+        out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
+    elif session.get("user_id"):
+        out = f'<a
