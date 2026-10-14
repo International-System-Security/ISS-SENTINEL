@@ -1390,4 +1390,660 @@ def auth_nav():
     elif session.get("agent_id"):
         out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
     elif session.get("user_id"):
-        out = f'<a
+        out = f'<a  class="btn" href="/admin" {small}>Admin Portal</a>'
+    elif session.get("agent_id"):
+        out = f'<a class="btn line" href="/agent" {small}>Agent Dashboard</a>'
+    elif session.get("user_id"):
+        out = f'<a class="btn line" href="/account" {small}>{escape(session.get("user_name", "Account"))}</a>'
+    else:
+        return f'<a class="btn line" href="/login" {small}>Login</a><a class="btn line" href="/register" {small}>Register</a>'
+    return out + (f'<form method="POST" action="/logout"><input type="hidden" name="csrf" value="{csrf_token()}">'
+                  f'<button class="btn line" {small}>Logout</button></form>')
+
+
+try:
+    PIL_OK
+except NameError:
+    PIL_OK = True
+
+
+AUTH_TPL = r"""
+<div class="card" style="max-width:380px;margin:50px auto"><h3>{{ heading }}</h3>
+  {% if err %}<p class="err">{{ err }}</p>{% endif %}
+  <form method="POST"><input type="hidden" name="csrf" value="{{ csrf() }}">
+    {% if register %}<input name="name" placeholder="Full name" required>{% endif %}
+    <input name="email" type="email" placeholder="Email" required>
+    <input name="password" type="password" placeholder="Password{% if register %} (min 8 characters){% endif %}" required>
+    <button type="submit" style="width:100%">{{ heading }}</button></form>
+  <p class="m">{% if register %}Already have an account? <a href="/login">Login</a>{% else %}New here? <a href="/register">Register</a>{% endif %}
+  &middot; <a href="/">Home</a> &middot; <a href="/client-login">Client Portal</a></p></div>
+"""
+
+
+@app.route("/register", methods=["GET", "POST"])
+@limiter.limit("10 per hour", methods=["POST"])
+def register():
+    err = ""
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()[:60]
+        email = request.form.get("email", "").strip().lower()[:120]
+        pwd = request.form.get("password", "")
+        db = get_db()
+        if not name or "@" not in email:
+            err = "Enter your name and a valid email."
+        elif len(pwd) < 8:
+            err = "Password must be at least 8 characters."
+        elif db.execute("SELECT 1 FROM users WHERE email=? UNION SELECT 1 FROM agents WHERE lower(email)=? UNION SELECT 1 FROM admins WHERE lower(email)=?",
+                        (email, email, email)).fetchone():
+            err = "This email is already registered."
+        else:
+            cur = db.execute("INSERT INTO users(email,name,password_hash,created) VALUES(?,?,?,?)",
+                             (email, name, generate_password_hash(pwd), now()))
+            db.commit()
+            session.clear()
+            session["user_id"], session["user_name"] = cur.lastrowid, name
+            return redirect(url_for("account"))
+    return page("Register", AUTH_TPL, heading="Register", register=True, err=err)
+
+
+@app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10 per minute", methods=["POST"])
+def login():
+    err = ""
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        pwd = request.form.get("password", "")
+        db = get_db()
+        a = db.execute("SELECT * FROM admins WHERE lower(email)=?", (email,)).fetchone()
+        ag = db.execute("SELECT * FROM agents WHERE lower(email)=?", (email,)).fetchone()
+        u = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if a and check_password_hash(a["password_hash"], pwd):
+            session.clear()
+            session["is_admin"], session["admin_email"] = True, a["email"]
+            return redirect(url_for("home"))
+        if ag and check_password_hash(ag["password_hash"], pwd):
+            session.clear()
+            session["agent_id"] = ag["id"]
+            return redirect(url_for("agent_dashboard"))
+        if u and check_password_hash(u["password_hash"], pwd):
+            session.clear()
+            session["user_id"], session["user_name"] = u["id"], u["name"]
+            return redirect(url_for("account"))
+        err = "Wrong email or password."
+    return page("Login", AUTH_TPL, heading="Login", register=False, err=err)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("home"))
+
+
+@app.route("/account")
+def account():
+    if not session.get("user_id"):
+        return redirect(url_for("login"))
+    return page("My Account", """
+    <h2>Welcome, {{ name }}</h2><p class="m">Thank you for joining ISS.</p>
+    <div class="card"><h3>Quick links</h3>
+      <a class="btn" href="/#plans">View plans</a> <a class="btn btn2" href="/verify">Verify a seller</a>
+      <a class="btn btn2" href="/client-login">Client Portal</a></div>
+    <div class="card"><h3>How to buy</h3><p class="m">Join our Discord, open the ISS Cyber Defence Suite category and click Buy Now. Always ask the seller for a Trade Certificate and verify it first.</p></div>
+    """, name=session.get("user_name", ""))
+
+
+# ------------------------------------------------------------------
+# Trade certificates (image) + exact verification
+# ------------------------------------------------------------------
+if PIL_OK:
+    Image.MAX_IMAGE_PIXELS = 20_000_000
+
+
+def _font(size):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def make_certificate(c):
+    W, H = 1600, 1100
+    im = Image.new("RGB", (W, H), (7, 9, 12))
+    d = ImageDraw.Draw(im)
+    cy, am, tx, mu = (0, 217, 255), (255, 178, 36), (220, 230, 238), (127, 147, 163)
+    for x in range(0, W, 64):
+        d.line([(x, 0), (x, H)], fill=(14, 22, 30))
+    for y in range(0, H, 64):
+        d.line([(0, y), (W, y)], fill=(14, 22, 30))
+    d.rectangle([30, 30, W - 30, H - 30], outline=cy, width=3)
+    d.rectangle([48, 48, W - 48, H - 48], outline=(29, 42, 53), width=2)
+    for x, y, dx, dy in [(30, 30, 1, 1), (W - 30, 30, -1, 1), (30, H - 30, 1, -1), (W - 30, H - 30, -1, -1)]:
+        d.line([(x, y), (x + dx * 90, y)], fill=am, width=8)
+        d.line([(x, y), (x, y + dy * 90)], fill=am, width=8)
+
+    def ct(y, text, size, fill, maxw=W - 220):
+        f = _font(size)
+        while d.textbbox((0, 0), text, font=f)[2] > maxw and size > 14:
+            size -= 2
+            f = _font(size)
+        b = d.textbbox((0, 0), text, font=f)
+        d.text(((W - (b[2] - b[0])) // 2, y), text, font=f, fill=fill)
+
+    if LOGO_BYTES:
+        try:
+            logo = Image.open(io.BytesIO(LOGO_BYTES)).convert("RGBA")
+            logo.thumbnail((300, 180))
+            im.paste(logo, ((W - logo.width) // 2, 80), logo)
+        except Exception:
+            pass
+    ct(290, "TRADE CERTIFICATE", 86, cy)
+    ct(395, c["role"].upper(), 34, am)
+    ct(470, "This is to certify that", 32, mu)
+    ct(525, c["name"], 78, (255, 255, 255))
+    ct(630, c["org"] or "", 40, tx)
+    ct(705, "is an officially recognized representative of International System Security", 30, mu)
+    ct(745, "and is authorized to sell ISS Cyber Defence Suite plans.", 30, mu)
+    fields = [("CERTIFICATE ID", c["cert_id"]), ("COUNTRY", c["country"] or "-"), ("VALID FROM", c["valid_from"]), ("VALID UNTIL", c["valid_to"])]
+    colw = (W - 240) // 4
+    for i, (k, v) in enumerate(fields):
+        x = 120 + i * colw
+        d.text((x, 860), k, font=_font(22), fill=mu)
+        d.text((x, 895), str(v), font=_font(30), fill=tx)
+    d.line([(120, 970), (W - 120, 970)], fill=(29, 42, 53), width=2)
+    ct(990, "International System Security  |  New window of world wide web", 28, mu)
+    ct(1035, "Verify authenticity: upload this exact image at " + request.host + "/verify", 22, mu)
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def pixel_hash(data):
+    """Exact pixel-level fingerprint: any changed pixel gives a different hash."""
+    try:
+        im = Image.open(io.BytesIO(data))
+        if im.size[0] * im.size[1] > 16_000_000:
+            return None
+        im = im.convert("RGBA")
+        return hashlib.sha256(("%dx%d" % im.size).encode() + im.tobytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def cert_state(c):
+    today = date.today().isoformat()
+    if c["status"] == "revoked":
+        return "revoked"
+    if c["valid_to"] < today:
+        return "expired"
+    if c["valid_from"] > today:
+        return "not yet valid"
+    return "valid"
+
+
+CERTS_TPL = r"""
+<div class="top"><h2>Certificates &amp; Agents</h2><a class="btn btn2" href="/admin">&larr; Admin Portal</a></div>
+<div class="card"><h3>Issue a trade certificate</h3>
+  <form method="POST"><input type="hidden" name="csrf" value="{{ csrf() }}"><input type="hidden" name="action" value="issue">
+    <input name="name" placeholder="Full name" required>
+    <input name="email" type="email" placeholder="Email" required>
+    <input name="org" placeholder="Business / shop name" required>
+    <input name="country" placeholder="Country">
+    <input name="phone" placeholder="Phone">
+    <input name="discord" placeholder="Discord username">
+    <input name="role" placeholder="Role (default: Authorized ISS Seller)">
+    <input name="valid_from" placeholder="Valid from YYYY-MM-DD (default today)">
+    <input name="valid_to" placeholder="Valid until YYYY-MM-DD" required>
+    <button type="submit">Generate certificate</button></form></div>
+<div class="card"><h3>Issued certificates</h3>
+  <table><tr><th>ID</th><th>Holder</th><th>Valid until</th><th>Status</th><th>Checks</th><th></th></tr>
+  {% for c in certs %}<tr><td>{{ c.cert_id }}</td><td>{{ c.name }}<br><span class="m">{{ c.org }} &middot; {{ c.email }}</span></td><td>{{ c.valid_to }}</td>
+    <td>{% if c.state == 'valid' %}<span class="pill g">valid</span>{% else %}<span class="pill r">{{ c.state }}</span>{% endif %}</td><td>{{ c.verified_count }}</td>
+    <td><a class="btn" href="/admin/certificates/{{ c.id }}.png" style="padding:7px 12px">Download</a>
+    {% if c.status != 'revoked' %}<form method="POST" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf() }}"><input type="hidden" name="action" value="revoke"><input type="hidden" name="id" value="{{ c.id }}"><button class="btn2" style="padding:7px 12px">Revoke</button></form>{% endif %}</td></tr>{% endfor %}</table></div>
+<div class="card"><h3>Add agent</h3><p class="m">The agent gets a private dashboard to see their certificate status and validity.</p>
+  <form method="POST"><input type="hidden" name="csrf" value="{{ csrf() }}"><input type="hidden" name="action" value="add_agent">
+    <input name="username" placeholder="Username" required><input name="email" type="email" placeholder="Email (same as on the certificate)" required>
+    <input name="password" type="password" placeholder="Password (min 8)" required><button type="submit">Create agent</button></form>
+  {% if agents %}<table style="margin-top:14px"><tr><th>Username</th><th>Email</th><th></th></tr>
+  {% for a in agents %}<tr><td>{{ a.username }}</td><td>{{ a.email }}</td><td><form method="POST" onsubmit="return confirm('Delete agent?')"><input type="hidden" name="csrf" value="{{ csrf() }}"><input type="hidden" name="action" value="delete_agent"><input type="hidden" name="id" value="{{ a.id }}"><button class="btn2" style="padding:7px 12px">Delete</button></form></td></tr>{% endfor %}</table>{% endif %}</div>
+"""
+
+
+@app.route("/admin/certificates", methods=["GET", "POST"])
+@admin_required
+def admin_certificates():
+    db = get_db()
+    if request.method == "POST":
+        act = request.form.get("action")
+        f = request.form
+        if act == "issue" and not PIL_OK:
+            flash("Certificates need the pillow library. Add pillow to requirements.txt and redeploy.")
+            return redirect(url_for("admin_certificates"))
+        if act == "issue":
+            name, email, org = f.get("name", "").strip()[:80], f.get("email", "").strip().lower()[:120], f.get("org", "").strip()[:80]
+            vfrom = f.get("valid_from", "").strip() or date.today().isoformat()
+            vto = f.get("valid_to", "").strip()
+            try:
+                date.fromisoformat(vfrom)
+                date.fromisoformat(vto)
+            except ValueError:
+                flash("Dates must be in YYYY-MM-DD format.")
+                return redirect(url_for("admin_certificates"))
+            if not (name and org and "@" in email) or vto < vfrom:
+                flash("Name, business, a valid email and a valid date range are required.")
+                return redirect(url_for("admin_certificates"))
+            c = {"cert_id": "ISS-TC-" + secrets.token_hex(4).upper(), "name": name, "org": org, "email": email,
+                 "country": f.get("country", "").strip()[:40], "phone": f.get("phone", "").strip()[:30],
+                 "discord": f.get("discord", "").strip()[:40], "role": f.get("role", "").strip()[:40] or "Authorized ISS Seller",
+                 "valid_from": vfrom, "valid_to": vto}
+            png = make_certificate(c)
+            db.execute("INSERT INTO certificates(cert_id,name,email,org,country,phone,discord,role,valid_from,valid_to,pixel_hash,png,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (c["cert_id"], name, email, org, c["country"], c["phone"], c["discord"], c["role"], vfrom, vto, pixel_hash(png), png, now()))
+            db.commit()
+            flash("Certificate %s created. Download it below and send it as a file." % c["cert_id"])
+        elif act == "revoke":
+            db.execute("UPDATE certificates SET status='revoked' WHERE id=?", (f.get("id", ""),))
+            db.commit()
+            flash("Certificate revoked.")
+        elif act == "add_agent":
+            un, em, pw = f.get("username", "").strip()[:40], f.get("email", "").strip().lower()[:120], f.get("password", "")
+            if not un or "@" not in em or len(pw) < 8:
+                flash("Username, valid email and a password of at least 8 characters are required.")
+            else:
+                try:
+                    db.execute("INSERT INTO agents(username,email,password_hash,created) VALUES(?,?,?,?)", (un, em, generate_password_hash(pw), now()))
+                    db.commit()
+                    flash("Agent created. They can log in at /login with their email and password.")
+                except sqlite3.IntegrityError:
+                    flash("That username or email already exists.")
+        elif act == "delete_agent":
+            db.execute("DELETE FROM agents WHERE id=?", (f.get("id", ""),))
+            db.commit()
+        return redirect(url_for("admin_certificates"))
+    certs = [dict(c, state=cert_state(c)) for c in db.execute(
+        "SELECT id,cert_id,name,email,org,valid_to,status,verified_count FROM certificates ORDER BY id DESC").fetchall()]
+    agents = db.execute("SELECT * FROM agents ORDER BY id DESC").fetchall()
+    return page("Certificates", CERTS_TPL, certs=certs, agents=agents)
+
+
+@app.route("/admin/certificates/<int:cid>.png")
+@admin_required
+def admin_cert_png(cid):
+    c = get_db().execute("SELECT cert_id, png FROM certificates WHERE id=?", (cid,)).fetchone()
+    if not c:
+        abort(404)
+    return Response(c["png"], mimetype="image/png",
+                    headers={"Content-Disposition": 'attachment; filename="%s.png"' % c["cert_id"]})
+
+
+VERIFY_TPL = r"""
+<div class="top"><h2>Verify Certificate</h2><a class="btn btn2" href="/">&larr; Home</a></div>
+<div class="card"><p class="m">Upload the Trade Certificate image the seller gave you. It must be the original file. It is compared pixel by pixel with the certificate we issued, so any edit, crop or screenshot fails.</p>
+  <form method="POST" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf() }}">
+    <input type="file" name="image" accept="image/png,image/*" required><button type="submit">Verify</button></form></div>
+{% if result %}<div class="card res {{ 'okc' if result.ok else 'bad' }}">
+  <div class="mark">{{ '&#10004;' if result.ok else '&#10008;' }}</div>
+  <h2>{{ 'VERIFIED' if result.ok else 'NOT VERIFIED' }}</h2>
+  {% if result.ok %}<p>{{ result.name }} ({{ result.org }}) is an authorized ISS seller.</p><p class="m">Certificate {{ result.cert_id }} &middot; valid until {{ result.valid_to }}</p>
+  {% else %}<p>{{ result.reason }}</p><p class="m">Do not buy from this seller. Report them on our Discord.</p>{% endif %}</div>{% endif %}
+"""
+
+
+@app.route("/verify", methods=["GET", "POST"])
+@limiter.limit("30 per hour", methods=["POST"])
+def verify():
+    result = None
+    if request.method == "POST":
+        f = request.files.get("image")
+        data = f.read() if f else b""
+        h = pixel_hash(data) if data else None
+        c = get_db().execute("SELECT * FROM certificates WHERE pixel_hash=?", (h,)).fetchone() if h else None
+        if not c:
+            result = {"ok": False, "reason": "This image does not exactly match any certificate issued by ISS. It is fake, edited or not the original file."}
+        elif cert_state(c) != "valid":
+            result = {"ok": False, "reason": "This certificate is %s." % cert_state(c)}
+        else:
+            db = get_db()
+            db.execute("UPDATE certificates SET verified_count = verified_count + 1 WHERE id=?", (c["id"],))
+            db.commit()
+            result = {"ok": True, "name": c["name"], "org": c["org"], "cert_id": c["cert_id"], "valid_to": c["valid_to"]}
+    return page("Verify Certificate", VERIFY_TPL, result=result)
+
+
+# ------------------------------------------------------------------
+# Agent (seller) dashboard
+# ------------------------------------------------------------------
+@app.route("/agent")
+def agent_dashboard():
+    if not session.get("agent_id"):
+        return redirect(url_for("login"))
+    db = get_db()
+    ag = db.execute("SELECT * FROM agents WHERE id=?", (session["agent_id"],)).fetchone()
+    if not ag:
+        session.clear()
+        return redirect(url_for("login"))
+    rows = []
+    for c in db.execute("SELECT * FROM certificates WHERE lower(email)=? ORDER BY id DESC", (ag["email"].lower(),)).fetchall():
+        try:
+            left = (date.fromisoformat(c["valid_to"]) - date.today()).days
+        except ValueError:
+            left = 0
+        rows.append(dict(c, state=cert_state(c), left=left))
+    return page("Agent Dashboard", r"""
+    <div class="top"><h2>Agent Dashboard</h2><form method="POST" action="/logout"><input type="hidden" name="csrf" value="{{ csrf() }}"><button class="btn2">Logout</button></form></div>
+    <div class="card"><h3>{{ ag.username }}</h3><p class="m">{{ ag.email }}</p></div>
+    {% for c in rows %}<div class="card"><h3>{{ c.cert_id }} {% if c.state == 'valid' %}<span class="pill g">valid</span>{% else %}<span class="pill r">{{ c.state }}</span>{% endif %}</h3>
+      <p>{{ c.role }} &middot; {{ c.org }}</p>
+      <p class="m">Valid {{ c.valid_from }} to {{ c.valid_to }} &middot; {% if c.left >= 0 %}{{ c.left }} days left{% else %}expired {{ -c.left }} days ago{% endif %}</p>
+      <p class="m">Buyers have verified this certificate {{ c.verified_count }} time(s).</p>
+      {% if c.state != 'valid' %}<p class="err">There is a problem with this certificate. Please contact ISS support.</p>{% endif %}</div>
+    {% else %}<div class="card"><p class="m">No certificate is linked to your email yet. Contact ISS support.</p></div>{% endfor %}
+    """, ag=ag, rows=rows)
+
+
+# ------------------------------------------------------------------
+# Client portal: activate this device, test, account
+# ------------------------------------------------------------------
+def ua_name(ua):
+    ua = ua or ""
+    os_ = next((n for k, n in (("Windows", "Windows"), ("Android", "Android"), ("iPhone", "iPhone"), ("iPad", "iPad"), ("Mac OS", "macOS"), ("Linux", "Linux")) if k in ua), "Unknown OS")
+    br = next((n for k, n in (("Edg/", "Edge"), ("OPR/", "Opera"), ("Chrome/", "Chrome"), ("Firefox/", "Firefox"), ("Safari/", "Safari")) if k in ua), "Browser")
+    return f"{br} on {os_} (web)"
+
+
+@app.route("/client/activate-device", methods=["POST"])
+@client_required
+def client_activate_device():
+    dev = request.cookies.get("iss_dev") or secrets.token_hex(12)
+    name = ua_name(request.headers.get("User-Agent", ""))
+    info, err = api_authorize({"license_key": g.lic["key"], "device_id": "web-" + dev, "device_name": name})
+    flash(err[0]["message"] if err else f"This device is now active: {name}")
+    resp = redirect(url_for("client_dashboard"))
+    resp.set_cookie("iss_dev", dev, max_age=31536000, httponly=True, samesite="Lax")
+    return resp
+
+
+@app.route("/client/test", methods=["POST"])
+@client_required
+def client_test():
+    db = get_db()
+    key = g.lic["key"]
+    if db.execute("SELECT COUNT(*) FROM devices WHERE license_key=?", (key,)).fetchone()[0] == 0:
+        flash("Activate at least one device before running a test.")
+    else:
+        db.execute("INSERT INTO commands(license_key,type,created) VALUES(?,?,?)", (key, "eicar_test", now()))
+        db.commit()
+        flash("Test started. Every device running the ISS agent will show a pop-up within about 30 seconds.")
+    return redirect(url_for("client_dashboard"))
+
+
+@app.route("/client/account", methods=["GET", "POST"])
+@client_required
+def client_account():
+    if request.method == "POST":
+        new_user = request.form.get("username", "").strip()[:40]
+        cur_pw = request.form.get("current", "")
+        new_pw = request.form.get("new_password", "")
+        if not check_password_hash(g.lic["client_pwd_hash"], cur_pw):
+            flash("Current password is wrong.")
+        elif len(new_user) < 3 or len(new_pw) < 8 or new_pw.lower() == "admin":
+            flash("Username needs 3+ characters and the new password needs 8+ characters.")
+        else:
+            db = get_db()
+            db.execute("UPDATE licenses SET client_user=?, client_pwd_hash=?, must_change=0 WHERE key=?",
+                       (new_user, generate_password_hash(new_pw), g.lic["key"]))
+            db.commit()
+            flash("Login details updated.")
+            return redirect(url_for("client_dashboard"))
+    return page("Account", r"""
+    <div class="top"><h2>Account</h2>{% if not first %}<a class="btn btn2" href="/client-dashboard">&larr; Dashboard</a>{% endif %}</div>
+    <div class="card"><h3>Change username and password</h3>
+      <p class="m">Current username: <code>{{ u }}</code></p>
+      <form method="POST"><input type="hidden" name="csrf" value="{{ csrf() }}">
+        <input name="username" placeholder="New username" required>
+        <input name="current" type="password" placeholder="Current password (default: admin)" required>
+        <input name="new_password" type="password" placeholder="New password (min 8 characters)" required>
+        <button type="submit">Save</button></form></div>
+    """, u=g.lic["client_user"], first=bool(g.lic["must_change"]))
+
+
+# ------------------------------------------------------------------
+# Agent API: commands, events, threat hashes
+# ------------------------------------------------------------------
+@app.route("/api/agent/poll", methods=["POST"])
+@limiter.limit("120 per minute")
+def api_agent_poll():
+    data = request.get_json(silent=True) or {}
+    info, err = api_authorize(data)
+    if err:
+        return err
+    try:
+        since = int(data.get("since_id", 0))
+    except (TypeError, ValueError):
+        since = 0
+    cutoff = (datetime.utcnow() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+    conn = connect()
+    rows = conn.execute("SELECT id,type FROM commands WHERE license_key=? AND id>? AND created>=? ORDER BY id",
+                        (info["lic"]["key"], since, cutoff)).fetchall()
+    last = conn.execute("SELECT COALESCE(MAX(id),0) FROM commands WHERE license_key=?", (info["lic"]["key"],)).fetchone()[0]
+    conn.close()
+    return {"status": "ok", "commands": [dict(r) for r in rows], "last_id": last}
+
+
+@app.route("/api/agent/threats", methods=["POST"])
+@limiter.limit("30 per hour")
+def api_agent_threats():
+    info, err = api_authorize(request.get_json(silent=True) or {})
+    if err:
+        return err
+    conn = connect()
+    hashes = [r[0] for r in conn.execute("SELECT hash FROM threats").fetchall()]
+    conn.close()
+    return {"status": "ok", "hashes": hashes}
+
+
+@app.route("/api/agent/event", methods=["POST"])
+@limiter.limit("120 per minute")
+def api_agent_event():
+    data = request.get_json(silent=True) or {}
+    info, err = api_authorize(data)
+    if err:
+        return err
+    etype = str(data.get("type", ""))
+    if etype not in ("threat_blocked", "test_blocked", "test_missed"):
+        return {"status": "error", "message": "unknown event"}, 400
+    detail = str(data.get("detail", ""))[:200]
+    conn = connect()
+    conn.execute("INSERT INTO events(license_key,device_id,command_id,type,detail,created) VALUES(?,?,?,?,?,?)",
+                 (info["lic"]["key"], str(data.get("device_id", ""))[:64], int(data.get("command_id") or 0), etype, detail, now()))
+    conn.commit()
+    conn.close()
+    if etype == "threat_blocked":
+        send_discord_alert(f"🚨 Threat blocked on {info['device']} ({info['lic']['org']}): {detail}")
+    return {"status": "ok"}
+
+
+# ------------------------------------------------------------------
+# Health check (UptimeRobot pings this to keep the server awake)
+# ------------------------------------------------------------------
+@app.route("/health")
+@limiter.exempt
+def health():
+    return "OK"
+
+
+# ------------------------------------------------------------------
+# Discord bot - slash (/) commands, administrators only
+# ------------------------------------------------------------------
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+GUILD_ID = os.environ.get("DISCORD_GUILD_ID")  # optional: makes commands appear instantly
+
+
+async def _setup_hook():
+    if GUILD_ID:
+        guild = discord.Object(id=int(GUILD_ID))
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+    else:
+        await bot.tree.sync()
+
+
+bot.setup_hook = _setup_hook
+
+
+def q_one(sql, args=()):
+    conn = connect()
+    v = conn.execute(sql, args).fetchone()[0]
+    conn.close()
+    return v
+
+
+def q_all(sql, args=()):
+    conn = connect()
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    return rows
+
+
+def slash(name, desc):
+    def deco(fn):
+        fn = app_commands.checks.has_permissions(administrator=True)(fn)
+        fn = app_commands.default_permissions(administrator=True)(fn)
+        fn = app_commands.guild_only()(fn)
+        return bot.tree.command(name=name, description=desc)(fn)
+    return deco
+
+
+@bot.event
+async def on_ready():
+    print(f"Discord Bot logged in as {bot.user.name}")
+
+
+@bot.tree.error
+async def on_app_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "⛔ Only server administrators can use this command."
+    else:
+        print(f"Command error: {error}")
+        msg = "⚠️ Something went wrong. Please try again."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="report", description="Show the current system status")
+@app_commands.guild_only()
+async def report(interaction: discord.Interaction):
+    lic = q_one("SELECT COUNT(*) FROM licenses")
+    op = q_one("SELECT COUNT(*) FROM tickets WHERE status='open'")
+    await interaction.response.send_message(
+        f"🛡️ ISS Report: system active.\nLicenses: {lic} | Open tickets: {op}")
+
+
+@bot.tree.command(name="weekly_report", description="Show the report for the last 7 days")
+@app_commands.guild_only()
+async def weekly_report(interaction: discord.Interaction):
+    since = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+    nl = q_one("SELECT COUNT(*) FROM licenses WHERE created>=?", (since,))
+    nt = q_one("SELECT COUNT(*) FROM tickets WHERE created>=?", (since,))
+    op = q_one("SELECT COUNT(*) FROM tickets WHERE status='open'")
+    await interaction.response.send_message(
+        f"📈 ISS Weekly Report (7 days)\nNew licenses: {nl} | New tickets: {nt} | Open tickets now: {op}")
+
+
+@slash("setalert", "Send ISS alerts to this channel")
+async def setalert(interaction: discord.Interaction):
+    conn = connect()
+    conn.execute("INSERT OR REPLACE INTO settings VALUES('alert_channel', ?)",
+                 (str(interaction.channel_id),))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("✅ ISS alerts will now be posted in this channel.")
+
+
+@slash("licenses", "Show the 15 most recent licenses")
+async def licenses_cmd(interaction: discord.Interaction):
+    rows = q_all("SELECT key,name,org,plan,expiry FROM licenses ORDER BY created DESC LIMIT 15")
+    if not rows:
+        return await interaction.response.send_message("No licenses yet.", ephemeral=True)
+    lines = [f"`{r['key']}` | {r['name']} ({r['org']}) | {r['plan']} | {r['expiry']}" for r in rows]
+    await interaction.response.send_message("🔑 **Licenses**\n" + "\n".join(lines), ephemeral=True)
+
+
+@slash("newlicense", "Create a new client license")
+@app_commands.describe(name="Client name", org="Organization name",
+                       plan="Plan", days="Validity in days (default 365)")
+async def newlicense(interaction: discord.Interaction, name: str, org: str,
+                     plan: Literal["Basic Plan", "Standard Plan", "Pro Plan", "Enterprise Plan"] = "Basic Plan",
+                     days: app_commands.Range[int, 1, 3650] = 365):
+    key = "KEY-" + secrets.token_hex(6).upper()
+    user = "admin"
+    pwd = "admin"
+    expiry = (date.today() + timedelta(days=days)).isoformat()
+    conn = connect()
+    conn.execute("INSERT INTO licenses(key,name,org,expiry,max_devices,plan,client_user,client_pwd_hash,created,must_change) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (key, name, org, expiry, plan_devices(plan), plan, user, generate_password_hash(pwd), now(), 1))
+    conn.commit()
+    conn.close()
+    # only the admin who ran the command can see this (ephemeral)
+    await interaction.response.send_message(
+        f"🔑 **New license** (only you can see this)\nClient: {name} ({org}) | {plan}\n"
+        f"License Key: `{key}`\nUsername: `{user}`\nPassword: `{pwd}`\nExpiry: {expiry}\n"
+        f"⚠️ Give these details to the client now. They must change the default password at first login.", ephemeral=True)
+    send_discord_alert(f"🔑 New license `{key}` | **{name}** ({org}) | {plan}")
+
+
+@slash("deletelicense", "Delete a license")
+@app_commands.describe(key="License key, e.g. KEY-ABC123")
+async def deletelicense(interaction: discord.Interaction, key: str):
+    conn = connect()
+    cur = conn.execute("DELETE FROM licenses WHERE key=?", (key.strip(),))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        "🗑️ License deleted." if cur.rowcount else "⚠️ License key not found.", ephemeral=True)
+
+
+@slash("addthreat", "Add a file hash to the threat list")
+@app_commands.describe(sha256="SHA256 hash of the file", name="Threat name")
+async def addthreat(interaction: discord.Interaction, sha256: str, name: str):
+    h = sha256.strip().lower()
+    if len(h) != 64 or any(ch not in "0123456789abcdef" for ch in h):
+        return await interaction.response.send_message("⚠️ Please enter a valid 64-character SHA256 hash.", ephemeral=True)
+    conn = connect()
+    conn.execute("INSERT OR REPLACE INTO threats VALUES(?,?,?)", (h, name[:80], now()))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message("✅ Added to the threat list.", ephemeral=True)
+
+
+@slash("tickets", "List open support tickets")
+async def tickets_cmd(interaction: discord.Interaction):
+    rows = q_all("""SELECT t.id,t.subject,t.created,l.org FROM tickets t
+        LEFT JOIN licenses l ON l.key=t.license_key WHERE t.status='open' ORDER BY t.id DESC LIMIT 15""")
+    if not rows:
+        return await interaction.response.send_message("✅ No open tickets.")
+    lines = [f"#{r['id']} | {r['org']} | {r['subject']} | {r['created']}" for r in rows]
+    await interaction.response.send_message("🎫 **Open tickets**\n" + "\n".join(lines))
+
+
+def run_discord_bot():
+    if not BOT_TOKEN:
+        print("DISCORD_BOT_TOKEN not set - bot disabled.")
+        return
+    try:
+        asyncio.run(bot.start(BOT_TOKEN))
+    except Exception as e:
+        print(f"Bot error: {e}")
+
+
+init_db()
+
+if __name__ == "__main__":
+    threading.Thread(target=run_discord_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)),
+            debug=os.environ.get("FLASK_DEBUG", "0") == "1", use_reloader=False)
+
+# === END OF server.py (v7c) - if you can see this line, the file is complete ===
