@@ -4,9 +4,14 @@ What it does:
   * registers this PC with your license (the server enforces the device limit)
   * watches your folders and scans every new or changed file
   * quarantines anything that matches a signature or a threat hash from the ISS cloud
+  * keeps a new file under closer watch for 15 minutes after it first appears, so
+    malware that stays quiet at first and only starts acting later still gets caught,
+    not just malware that is obviously bad the instant it lands
+  * watches for ransomware-style behavior: many files being rewritten in a short time
+    in the same folder, which is quarantined even with no known signature match
   * shows a pop-up and reports the event to your Client Portal
   * runs the portal's "Test" button using the harmless EICAR test file, through the
-    SAME pipeline as a real threat
+    EXACT SAME pipeline as a real threat, so the test is a true test of real protection
 
 Usage:
   python agent.py                run protection (keep it running)
@@ -23,6 +28,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque, defaultdict
 
 import requests
 
@@ -31,6 +37,13 @@ CONFIG_FILE = "config.json"
 QUARANTINE_DIR = "quarantine"
 TEST_DIR = "iss_test"
 MAX_SCAN_BYTES = 50 * 1024 * 1024
+WATCH_WINDOW = 15 * 60          # keep re-checking a file for this long after it first appears
+RANSOM_WINDOW = 20               # seconds
+RANSOM_THRESHOLD = 8              # files rewritten in that window in one folder = suspicious
+SUSPICIOUS_DOUBLE_EXT = (".pdf.exe", ".doc.exe", ".jpg.exe", ".png.exe", ".xlsx.exe", ".zip.exe")
+
+first_seen = {}                   # path -> time first noticed (for the 15-minute watch window)
+recent_writes = defaultdict(lambda: deque())  # folder -> timestamps of recent file writes
 
 # Standard, harmless EICAR antivirus test string (split so this file is not flagged itself).
 EICAR = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$" + "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
@@ -88,7 +101,12 @@ def sha256_of(path):
 
 
 def detect(path):
-    """Return a threat name or None. Test files and real malware use this same check."""
+    """Return a threat name or None. Test files and real malware use this same check.
+    This also catches a file disguised with a double extension such as report.pdf.exe."""
+    low = path.lower()
+    for ext in SUSPICIOUS_DOUBLE_EXT:
+        if low.endswith(ext):
+            return "Disguised-File-Extension"
     try:
         if os.path.getsize(path) > MAX_SCAN_BYTES:
             return None
@@ -104,6 +122,18 @@ def detect(path):
     return None
 
 
+def check_ransomware_pattern(folder):
+    """If many files in one folder were rewritten in a short window, that is the
+    classic signature of ransomware encrypting everything it can reach, even when
+    none of the individual files match a known signature or hash."""
+    now_t = time.time()
+    dq = recent_writes[folder]
+    dq.append(now_t)
+    while dq and now_t - dq[0] > RANSOM_WINDOW:
+        dq.popleft()
+    return len(dq) >= RANSOM_THRESHOLD
+
+
 def quarantine(path):
     os.makedirs(QUARANTINE_DIR, exist_ok=True)
     dest = os.path.join(QUARANTINE_DIR, f"{int(time.time())}_{os.path.basename(path)}.iss")
@@ -113,9 +143,13 @@ def quarantine(path):
     return dest
 
 
-def handle_file(path, command_id=0, is_test=False):
-    """One pipeline for every file: detect, quarantine, warn, report."""
+def handle_file(path, command_id=0, is_test=False, folder=None):
+    """One pipeline for every file: detect, quarantine, warn, report.
+    Used identically for the EICAR test file and for anything found during real-time
+    or on-demand scanning, so a test genuinely exercises the real detection path."""
     name = detect(path)
+    if not name and folder and not is_test and check_ransomware_pattern(folder):
+        name = "Ransomware-Pattern (many files rewritten quickly)"
     if not name:
         return False
     try:
@@ -126,8 +160,8 @@ def handle_file(path, command_id=0, is_test=False):
             call("/api/agent/event", {"type": "test_missed", "command_id": command_id, "detail": "could not quarantine"})
         return False
     popup("ISS Security - Threat blocked", f"{name} was blocked and quarantined:\n{os.path.basename(path)}")
-    call("/api/agent/event", {"type": "test_blocked" if is_test else "threat_blocked", "command_id": command_id,
-                              "detail": f"{name}: {os.path.basename(path)}"})
+    etype = "test_blocked" if is_test else ("ransomware_pattern_blocked" if name.startswith("Ransomware") else "threat_blocked")
+    call("/api/agent/event", {"type": etype, "command_id": command_id, "detail": f"{name}: {os.path.basename(path)}"})
     return True
 
 
@@ -155,7 +189,12 @@ def watch_folders():
 
 
 def scan_folder(folder, seen=None, depth=2):
+    """Scans every file. A file that changed since last time is always rescanned.
+    A file that has NOT changed is still rescanned for its first 15 minutes, so a
+    threat the cloud only just learned about (or malware that waits before acting)
+    is still caught, not just malware that is obviously bad on first contact."""
     found = 0
+    now_t = time.time()
     base = folder.rstrip(os.sep).count(os.sep)
     for root, dirs, files in os.walk(folder):
         if root.count(os.sep) - base >= depth or QUARANTINE_DIR in root:
@@ -166,11 +205,15 @@ def scan_folder(folder, seen=None, depth=2):
                 m = os.path.getmtime(p)
             except OSError:
                 continue
-            if seen is not None:
-                if seen.get(p) == m:
-                    continue
+            first_seen.setdefault(p, now_t)
+            changed = seen is None or seen.get(p) != m
+            if seen is not None and changed:
                 seen[p] = m
-            if handle_file(p):
+                recent_writes[root].append(now_t)
+            within_watch_window = now_t - first_seen[p] < WATCH_WINDOW
+            if not (changed or within_watch_window):
+                continue
+            if handle_file(p, folder=root):
                 found += 1
     return found
 
